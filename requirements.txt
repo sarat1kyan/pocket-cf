@@ -1,0 +1,8 @@
+python-telegram-bot
+requests
+python-dateutil
+pytz
+matplotlib
+pandas
+plotly
+kaleido
