@@ -257,9 +257,7 @@ logging.basicConfig(level=logging.DEBUG)
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
 
-## 🙏 Acknowledgments
-
-# ⚠️ Disclaimer
+## ⚠️ Disclaimer
 
 **This is a non-official, community-created project**
 
@@ -319,6 +317,8 @@ For official Cloudflare tools and services, please visit:
 
 *This project is maintained by an individual developer in their spare time. Cloudflare® is a registered trademark of Cloudflare, Inc. This project is not affiliated with Cloudflare, Inc.*
 ---
+
+## 🙏 Acknowledgments
 
 **⭐ Star this repo if you found it helpful!**
 [![BuyMeACoffee](https://raw.githubusercontent.com/pachadotdev/buymeacoffee-badges/main/bmc-donate-yellow.svg)](https://www.buymeacoffee.com/saratikyan)
