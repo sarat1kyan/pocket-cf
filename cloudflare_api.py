@@ -24,7 +24,6 @@ class CloudflareAPI:
             resp = requests.request(method.upper(), url, headers=self.headers, params=params, json=json, timeout=timeout)
             logger.info("REST %s %s -> %s", method.upper(), path, resp.status_code)
             if resp.status_code == 404:
-                # convenience for callers that want to detect non-existence
                 return {"success": False, "status": 404}
             resp.raise_for_status()
             data = resp.json()
@@ -316,10 +315,8 @@ class CloudflareAPI:
 
     # ===================== RULESETS: RATE LIMITING ===========
     def _get_ratelimit_entrypoint(self, zone_id: Optional[str] = None) -> Tuple[Optional[str], Optional[Dict[str, Any]]]:
-        """Return (ruleset_id, raw_json) for the zone http_ratelimit entrypoint, or (None, None) if not present."""
         zid = zone_id or config.CLOUDFLARE_ZONE_ID
-        url_path = f"zones/{zid}/rulesets/phases/http_ratelimit/entrypoint"
-        data = self._rest_get(url_path)
+        data = self._rest_get(f"zones/{zid}/rulesets/phases/http_ratelimit/entrypoint")
         if not data:
             return (None, None)
         rid = (data.get("result") or {}).get("id")
