@@ -5,7 +5,7 @@ from typing import List, Dict, Any, Optional
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton, InputFile
 from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, ContextTypes
-from telegram.error import BadRequest, Forbidden
+from telegram.error import BadRequest
 
 from config import config
 from cloudflare_api import cf_api
@@ -25,14 +25,48 @@ logger = logging.getLogger(__name__)
 MITIGATIONS_24H_THRESHOLD = 30_000
 ORIGIN_SERVED_24H_MIN = 2_500_000  # requests with cacheStatus != HIT
 
-# runtime alarm control (optional)
-_alarm_task: Optional[asyncio.Task] = None
+NOT_ALLOWED_TEXT = "⛔ You’re not allowed to use this bot. Ask your manager for permission."
 
+# ========================= ADMIN GATE (GLOBAL) =========================
 def is_admin(user_id: int) -> bool:
     try:
         return int(user_id) in set(getattr(config, "ADMIN_USER_IDS", []))
     except Exception:
         return False
+
+def admins_only(func):
+    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
+        uid = (update.effective_user.id if update.effective_user else 0)
+        if not is_admin(uid):
+            # Answer callbacks with an alert and drop everything.
+            if update.callback_query:
+                try:
+                    await update.callback_query.answer(NOT_ALLOWED_TEXT, show_alert=True)
+                except Exception:
+                    pass
+            # Also send a message into chat (useful for command tries).
+            if update.effective_chat:
+                try:
+                    await context.bot.send_message(chat_id=update.effective_chat.id, text=NOT_ALLOWED_TEXT)
+                except Exception:
+                    pass
+            return
+        return await func(update, context)
+    return wrapper
+
+# Optional: audit of admin actions (set AUDIT_CHAT_ID in config or env to enable)
+async def audit(context: ContextTypes.DEFAULT_TYPE, update: Update, action: str, details: str = ""):
+    audit_chat = getattr(config, "AUDIT_CHAT_ID", None)
+    if not audit_chat:
+        return
+    u = update.effective_user
+    who = f"{u.id} (@{getattr(u, 'username', '-')})"
+    zone = context.chat_data.get("zone_name") or context.chat_data.get("zone_id") or getattr(config, "CLOUDFLARE_ZONE_ID", "-")
+    text = f"🧾 <b>{action}</b>\n👤 <code>{who}</code>\n🌐 <code>{zone}</code>\n{details}"
+    try:
+        await context.bot.send_message(int(audit_chat), text, parse_mode=ParseMode.HTML)
+    except Exception:
+        pass
 
 # ========================= ZONE CONTEXT =========================
 def get_active_zone(context: ContextTypes.DEFAULT_TYPE) -> Dict[str, str]:
@@ -68,18 +102,20 @@ def back_menu_kb(section: str, hours: int):
          InlineKeyboardButton("🔁 Refresh", callback_data=f"{section}:{hours}")],
     ])
 
-# ========================= BASIC COMMANDS =========================
+# ========================= BASIC COMMANDS (ALL ADMIN-GATED) =========================
+@admins_only
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     z = get_active_zone(context)
     txt = (
         "👋 <b>Cloudflare Control Bot</b>\n"
         "Use the inline menu below, or commands:\n\n"
         "<b>Read</b>: /status /verify /zones /export &lt;hours&gt;\n"
-        "<b>Manage</b> (admins): /ip_* /rule_* /dns_* /cache_purge /rl_* /toggle_bfm /toggle_sbfm\n"
+        "<b>Manage</b>: /ip_* /rule_* /dns_* /cache_purge /rl_* /toggle_bfm /toggle_sbfm\n"
         "<i>Tip: Tap 🌐 to switch zones.</i>"
     )
     await update.message.reply_text(txt, reply_markup=main_menu_kb(z.get("name")), parse_mode=ParseMode.HTML)
 
+@admins_only
 async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
     text = make_pre_table(
@@ -91,6 +127,7 @@ async def whoami(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.HTML
     )
 
+@admins_only
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     z = get_active_zone(context)
     msg = await update.message.reply_text("⏳ <i>Fetching zone…</i>", parse_mode=ParseMode.HTML)
@@ -110,6 +147,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     set_active_zone(context, z["id"], name)
     await msg.edit_text(txt, parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(name))
 
+@admins_only
 async def verify(update: Update, context: ContextTypes.DEFAULT_TYPE):
     z = get_active_zone(context)
     hours = int(context.args[0]) if context.args else 24
@@ -140,6 +178,7 @@ def _zones_keyboard(page: int, zones: List[Dict[str, Any]]):
     rows.append([InlineKeyboardButton("🏠 Home", callback_data="home")])
     return InlineKeyboardMarkup(rows)
 
+@admins_only
 async def zones_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = cf_api.list_zones(page=1, per_page=100)
     if not data:
@@ -149,7 +188,8 @@ async def zones_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("ℹ️ No zones.", parse_mode=ParseMode.HTML); return
     await update.message.reply_text("🌐 <b>Select a zone</b>", parse_mode=ParseMode.HTML, reply_markup=_zones_keyboard(1, zones))
 
-# ========================= CALLBACKS =========================
+# ========================= CALLBACKS (ADMIN-GATED) =========================
+@admins_only
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     try:
@@ -159,13 +199,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     data = (q.data or "").strip()
     z = get_active_zone(context)
 
-    # ----- direct routes w/out numeric suffix
     if data == "home":
         await q.edit_message_text("🏠 <b>Home</b> — choose an option:", parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(z.get("name"))); return
     if data == "refresh":
         data = "traffic:24"
 
-    # admin menu callbacks (fix for admin:help)
     if data == "admin" or data.startswith("admin:"):
         await q.edit_message_text(_admin_help(), parse_mode=ParseMode.HTML,
                                   reply_markup=InlineKeyboardMarkup([
@@ -176,10 +214,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                   ]))
         return
 
-    # BFM quick toggles via callback
     if data.startswith("bfm:") or data.startswith("sbfm:"):
-        if not is_admin(q.from_user.id):
-            await q.edit_message_text("⛔ <b>Admins only.</b>", parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(z.get("name"))); return
         val = data.split(":")[1].lower() == "on"
         ok = cf_api.set_bfm(val, zone_id=z["id"]) if data.startswith("bfm:") else cf_api.set_sbfm(val, zone_id=z["id"])
         name = "Bot Fight Mode" if data.startswith("bfm:") else "Super BFM"
@@ -187,7 +222,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                   parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(z.get("name")))
         return
 
-    # Zone paging and switching
     if data.startswith("zones:"):
         page = int((data.split(":")[1] or "1"))
         allz = (cf_api.list_zones(page=1, per_page=100) or {}).get("result") or []
@@ -199,10 +233,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         set_active_zone(context, zid, name)
         await q.edit_message_text(f"✅ Switched to <code>{name}</code>", parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(name)); return
 
-    # quick IP actions from security view
     if data.startswith("ipblock:") or data.startswith("ipchal:"):
-        if not is_admin(q.from_user.id):
-            await q.edit_message_text("⛔ <b>Admins only.</b>", parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(z.get("name"))); return
         ip = data.split(":", 1)[1]
         mode = "block" if data.startswith("ipblock:") else "challenge"
         target = "ip_range" if "/" in ip else "ip"
@@ -210,7 +241,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(f"{'✅' if ok else '❌'} {mode.title()} {ip}", parse_mode=ParseMode.HTML, reply_markup=main_menu_kb(z.get("name")))
         return
 
-    # parse generic section:hours
     try:
         section, hours_s = data.split(":")
         hours = int(hours_s)
@@ -267,7 +297,6 @@ async def render_security(q, context, hours: int):
         await q.edit_message_text("❌ <b>Failed to fetch security events.</b>", parse_mode=ParseMode.HTML, reply_markup=back_menu_kb("security", hours)); return
     html_events = format_security_for_html(gql, top_n=15)
 
-    # Top mitigated IPs + quick actions (block/challenge)
     ips = cf_api.get_top_mitigated_ips(hours=hours, limit=6, zone_id=z["id"])
     ip_rows, ip_buttons = [], []
     try:
@@ -308,7 +337,6 @@ async def render_dns(q, context, hours: int):
     )
 
 async def render_export(q, context, hours: int):
-    # call the /export logic and delete the inline message
     fake_update = Update(update_id=0)
     fake_update._effective_chat = q.message.chat
     fake_update._effective_user = q.from_user
@@ -354,7 +382,8 @@ async def render_rl_menu(q, context):
                                    InlineKeyboardButton("🏠 Home", callback_data="home")]
                               ]))
 
-# ========================= EXPORT =========================
+# ========================= EXPORT (ADMIN-GATED) =========================
+@admins_only
 async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE, hours_override: Optional[int] = None):
     z = get_active_zone(context)
     hours = hours_override if hours_override is not None else (int(context.args[0]) if context.args else 24)
@@ -394,41 +423,34 @@ def _admin_help() -> str:
     )
 
 def _deny_if_not_admin(func):
-    async def wrapper(update: Update, context: ContextTypes.DEFAULT_TYPE):
-        uid = update.effective_user.id if update.effective_user else 0
-        if not is_admin(uid):
-            await update.message.reply_text("⛔ <b>Admins only.</b>", parse_mode=ParseMode.HTML)
-            return
-        return await func(update, context)
-    return wrapper
+    # legacy decorator retained for clarity, but not used — global admin gate covers everything now
+    return admins_only(func)
 
-# ========================= ADMIN COMMANDS =========================
+# ========================= ADMIN COMMANDS (ALL HAVE @admins_only) =========================
 # --- IP Access Rules
-async def _ip_rule_common(update: Update, context: ContextTypes.DEFAULT_TYPE, mode: str, value: str, notes: str):
-    z = get_active_zone(context)
-    target = "ip_range" if "/" in value else "ip"
-    resp = cf_api.create_access_rule(mode=mode, target=target, value=value, notes=notes, zone_id=z["id"])
-    if not resp:
-        await update.message.reply_text(f"❌ Failed to create access rule ({mode}).", parse_mode=ParseMode.HTML); return
-    r = (resp.get("result") or {})
-    await update.message.reply_text(
-        f"✅ <b>{mode}</b> rule created\n<pre>ID        {r.get('id')}\nTarget    {target}\nValue     {value}\nNotes     {notes or '-'}</pre>",
-        parse_mode=ParseMode.HTML
-    )
-
-@_deny_if_not_admin
+@admins_only
 async def ip_allow(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Usage: /ip_allow <ip|cidr> [notes]", parse_mode=ParseMode.HTML); return
-    await _ip_rule_common(update, context, "whitelist", context.args[0], " ".join(context.args[1:]) if len(context.args) > 1 else "")
+    z = get_active_zone(context)
+    value = context.args[0]; notes = " ".join(context.args[1:]) if len(context.args) > 1 else ""
+    target = "ip_range" if "/" in value else "ip"
+    resp = cf_api.create_access_rule(mode="whitelist", target=target, value=value, notes=notes, zone_id=z["id"])
+    await audit(context, update, "IP Allow", f"<code>{value}</code>")
+    await update.message.reply_text("✅ Allow created." if resp else "❌ Failed.", parse_mode=ParseMode.HTML)
 
-@_deny_if_not_admin
+@admins_only
 async def ip_block(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Usage: /ip_block <ip|cidr> [notes]", parse_mode=ParseMode.HTML); return
-    await _ip_rule_common(update, context, "block", context.args[0], " ".join(context.args[1:]) if len(context.args) > 1 else "")
+    z = get_active_zone(context)
+    value = context.args[0]; notes = " ".join(context.args[1:]) if len(context.args) > 1 else ""
+    target = "ip_range" if "/" in value else "ip"
+    resp = cf_api.create_access_rule(mode="block", target=target, value=value, notes=notes, zone_id=z["id"])
+    await audit(context, update, "IP Block", f"<code>{value}</code>")
+    await update.message.reply_text("✅ Block created." if resp else "❌ Failed.", parse_mode=ParseMode.HTML)
 
-@_deny_if_not_admin
+@admins_only
 async def ip_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     z = get_active_zone(context)
     if not context.args:
@@ -453,9 +475,10 @@ async def ip_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Not found.", parse_mode=ParseMode.HTML); return
 
     ok = cf_api.delete_access_rule(rule_id, zone_id=z["id"])
+    await audit(context, update, "IP Rule Delete", f"<code>{rule_id}</code>")
     await update.message.reply_text("🗑️ Deleted." if ok else "❌ Delete failed.", parse_mode=ParseMode.HTML)
 
-@_deny_if_not_admin
+@admins_only
 async def ip_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     z = get_active_zone(context)
     mode = context.args[0] if context.args else None
@@ -479,7 +502,7 @@ def _split_expr_desc(args: List[str]) -> tuple[str, str]:
         expr, desc = joined, ""
     return expr.strip(), desc.strip()
 
-@_deny_if_not_admin
+@admins_only
 async def rules_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     z = get_active_zone(context)
     data = cf_api.list_firewall_rules(zone_id=z["id"])
@@ -493,7 +516,7 @@ async def rules_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("<i>No firewall rules.</i>", parse_mode=ParseMode.HTML); return
     await update.message.reply_text(make_pre_table(rows, ["ID", "Action", "Paused", "Desc", "Expr"]), parse_mode=ParseMode.HTML)
 
-@_deny_if_not_admin
+@admins_only
 async def rule_block(update: Update, context: ContextTypes.DEFAULT_TYPE):
     z = get_active_zone(context)
     if not context.args:
@@ -504,9 +527,10 @@ async def rule_block(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Filter create failed.", parse_mode=ParseMode.HTML); return
     filter_id = (f["result"][0] or {}).get("id")
     r = cf_api.create_firewall_rule(filter_id, action="block", description=desc or "rule_block", zone_id=z["id"])
+    await audit(context, update, "FW Rule Block", f"<code>{expr}</code>")
     await update.message.reply_text("✅ Created blocking rule." if r else "❌ Rule create failed.", parse_mode=ParseMode.HTML)
 
-@_deny_if_not_admin
+@admins_only
 async def rule_bypass_waf(update: Update, context: ContextTypes.DEFAULT_TYPE):
     z = get_active_zone(context)
     if not context.args:
@@ -517,23 +541,26 @@ async def rule_bypass_waf(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Filter create failed.", parse_mode=ParseMode.HTML); return
     filter_id = (f["result"][0] or {}).get("id")
     r = cf_api.create_firewall_rule(filter_id, action="bypass", description=desc or "bypass_waf", products=["waf"], zone_id=z["id"])
+    await audit(context, update, "FW Rule Bypass WAF", f"<code>{expr}</code>")
     await update.message.reply_text("✅ Created WAF-bypass rule." if r else "❌ Rule create failed.", parse_mode=ParseMode.HTML)
 
 # --- Cache purge
-@_deny_if_not_admin
+@admins_only
 async def cache_purge(update: Update, context: ContextTypes.DEFAULT_TYPE):
     z = get_active_zone(context)
     if not context.args:
         await update.message.reply_text("Usage: /cache_purge all|<url1> <url2> ...", parse_mode=ParseMode.HTML); return
     if len(context.args) == 1 and context.args[0].lower() == "all":
         ok = cf_api.purge_cache_everything(zone_id=z["id"])
+        await audit(context, update, "Cache Purge", "everything")
         await update.message.reply_text("🧹 Purge everything: ✅" if ok else "🧹 Purge everything: ❌", parse_mode=ParseMode.HTML)
     else:
         ok = cf_api.purge_cache_files(context.args, zone_id=z["id"])
+        await audit(context, update, "Cache Purge Files", "<br>".join(context.args))
         await update.message.reply_text("🧹 Purge files: ✅" if ok else "🧹 Purge files: ❌", parse_mode=ParseMode.HTML)
 
 # --- DNS CRUD
-@_deny_if_not_admin
+@admins_only
 async def dns_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     z = get_active_zone(context)
     name = context.args[0] if context.args else None
@@ -547,7 +574,7 @@ async def dns_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("<i>No DNS records.</i>", parse_mode=ParseMode.HTML); return
     await update.message.reply_text(make_pre_table(rows, ["ID", "Type", "Name", "Content", "TTL", "Proxy"]), parse_mode=ParseMode.HTML)
 
-@_deny_if_not_admin
+@admins_only
 async def dns_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     z = get_active_zone(context)
     if len(context.args) < 3:
@@ -558,9 +585,10 @@ async def dns_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if len(context.args) >= 5:
         proxied = context.args[4].lower() in ("1", "true", "yes", "on")
     r = cf_api.create_dns_record(typ.upper(), name, content, ttl=ttl, proxied=proxied if proxied is not None else True, zone_id=z["id"])
+    await audit(context, update, "DNS Add", f"<code>{typ} {name} -> {content}</code>")
     await update.message.reply_text("✅ DNS record created." if r else "❌ Failed to create DNS record.", parse_mode=ParseMode.HTML)
 
-@_deny_if_not_admin
+@admins_only
 async def dns_upd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     z = get_active_zone(context)
     if len(context.args) < 2:
@@ -577,31 +605,35 @@ async def dns_upd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             fields[k] = v
     r = cf_api.update_dns_record(rid, zone_id=z["id"], **fields)
+    await audit(context, update, "DNS Update", f"<code>{rid}</code> {fields}")
     await update.message.reply_text("✅ DNS record updated." if r else "❌ DNS update failed.", parse_mode=ParseMode.HTML)
 
-@_deny_if_not_admin
+@admins_only
 async def dns_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
     z = get_active_zone(context)
     if not context.args:
         await update.message.reply_text("Usage: /dns_del <ID>", parse_mode=ParseMode.HTML); return
     ok = cf_api.delete_dns_record(context.args[0], zone_id=z["id"])
+    await audit(context, update, "DNS Delete", f"<code>{context.args[0]}</code>")
     await update.message.reply_text("🗑️ Deleted." if ok else "❌ Delete failed.", parse_mode=ParseMode.HTML)
 
 # --- BFM toggles (commands)
-@_deny_if_not_admin
+@admins_only
 async def toggle_bfm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     z = get_active_zone(context)
     if not context.args or context.args[0].lower() not in ("on","off"):
         await update.message.reply_text("Usage: /toggle_bfm on|off", parse_mode=ParseMode.HTML); return
     ok = cf_api.set_bfm(context.args[0].lower() == "on", zone_id=z["id"])
+    await audit(context, update, "Toggle BFM", context.args[0].lower())
     await update.message.reply_text("🤖 Bot Fight Mode: ✅" if ok else "🤖 Bot Fight Mode: ❌", parse_mode=ParseMode.HTML)
 
-@_deny_if_not_admin
+@admins_only
 async def toggle_sbfm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     z = get_active_zone(context)
     if not context.args or context.args[0].lower() not in ("on","off"):
         await update.message.reply_text("Usage: /toggle_sbfm on|off", parse_mode=ParseMode.HTML); return
     ok = cf_api.set_sbfm(context.args[0].lower() == "on", zone_id=z["id"])
+    await audit(context, update, "Toggle Super BFM", context.args[0].lower())
     await update.message.reply_text("🛡️ Super BFM: ✅" if ok else "🛡️ Super BFM: ❌", parse_mode=ParseMode.HTML)
 
 # --- RATE LIMIT BUILDER (commands)
@@ -610,7 +642,7 @@ def _parse_action(arg: Optional[str]) -> str:
     a = arg.lower()
     return a if a in ("block","challenge") else "block"
 
-@_deny_if_not_admin
+@admins_only
 async def rl_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
     z = get_active_zone(context)
     rules = cf_api.list_ratelimit_rules(zone_id=z["id"])
@@ -629,7 +661,7 @@ async def rl_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
     await update.message.reply_text(make_pre_table(rows, ["ID","Action","Req","Period","Timeout","Expr"]), parse_mode=ParseMode.HTML)
 
-@_deny_if_not_admin
+@admins_only
 async def rl_add_path(update: Update, context: ContextTypes.DEFAULT_TYPE):
     z = get_active_zone(context)
     if len(context.args) < 3:
@@ -640,9 +672,10 @@ async def rl_add_path(update: Update, context: ContextTypes.DEFAULT_TYPE):
     action = _parse_action(context.args[4] if len(context.args) >= 5 else None)
     expr = f'(http.request.uri.path contains "{path}")'
     r = cf_api.add_ratelimit_rule(expr, thr, per, mitigation_timeout=timeout, action=action, zone_id=z["id"], description=f"Path {path}")
+    await audit(context, update, "RL Add Path", f"<code>{path}</code> thr={thr} per={per}s act={action}")
     await update.message.reply_text("✅ Added rate limit." if r else "❌ Failed to add rule.", parse_mode=ParseMode.HTML)
 
-@_deny_if_not_admin
+@admins_only
 async def rl_add_asn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     z = get_active_zone(context)
     if len(context.args) < 3:
@@ -658,14 +691,16 @@ async def rl_add_asn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if path_filter:
         expr = f'({expr} and http.request.uri.path contains "{path_filter}")'
     r = cf_api.add_ratelimit_rule(expr, thr, per, mitigation_timeout=timeout, action=action, zone_id=z["id"], description=f"ASN {asn}"+(f" path={path_filter}" if path_filter else ""))
+    await audit(context, update, "RL Add ASN", f"asn={asn} thr={thr} per={per}s act={action} path={path_filter or '-'}")
     await update.message.reply_text("✅ Added rate limit." if r else "❌ Failed to add rule.", parse_mode=ParseMode.HTML)
 
-@_deny_if_not_admin
+@admins_only
 async def rl_del(update: Update, context: ContextTypes.DEFAULT_TYPE):
     z = get_active_zone(context)
     if not context.args:
         await update.message.reply_text("Usage: /rl_del <rule_id>", parse_mode=ParseMode.HTML); return
     ok = cf_api.delete_ratelimit_rule(context.args[0], zone_id=z["id"])
+    await audit(context, update, "RL Delete", f"<code>{context.args[0]}</code>")
     await update.message.reply_text("🗑️ Deleted." if ok else "❌ Delete failed.", parse_mode=ParseMode.HTML)
 
 # ========================= ERROR HANDLER =========================
@@ -682,7 +717,7 @@ def main():
     logger.info("Starting Cloudflare Telegram Bot...")
     app = Application.builder().token(config.TELEGRAM_BOT_TOKEN).build()
 
-    # Basic
+    # All commands admin-gated via @admins_only
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("status", status))
     app.add_handler(CommandHandler("verify", verify))
@@ -690,7 +725,6 @@ def main():
     app.add_handler(CommandHandler("export", export_cmd))
     app.add_handler(CommandHandler("whoami", whoami))
 
-    # Admin write commands
     app.add_handler(CommandHandler("ip_list", ip_list))
     app.add_handler(CommandHandler("ip_allow", ip_allow))
     app.add_handler(CommandHandler("ip_block", ip_block))
@@ -715,7 +749,7 @@ def main():
     app.add_handler(CommandHandler("toggle_bfm", toggle_bfm))
     app.add_handler(CommandHandler("toggle_sbfm", toggle_sbfm))
 
-    # Callbacks & errors
+    # Callbacks (also admin-gated via decorator)
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_error_handler(handle_error)
 
