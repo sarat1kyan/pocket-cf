@@ -34,6 +34,9 @@ A powerful (Non-Official) Telegram bot that transforms your Cloudflare managemen
 - **Traffic Anomalies**: Unusual request patterns
 - **Security Thresholds**: High mitigation volumes
 - **Origin Health**: Cache effectiveness monitoring
+- **Cloudflare Status**: Real-time monitoring of Cloudflare status page for new incidents
+- **Origin Monitoring**: Track origin server health and get alerts on 5xx errors
+- **Origin Served Alerts**: Monitor cache misses and alert on low request volumes
 
 ## 🛠️ Setup
 
@@ -44,15 +47,66 @@ A powerful (Non-Official) Telegram bot that transforms your Cloudflare managemen
 
 ### Installation
 
-1. **Clone & Install**
+#### Quick Start (Recommended)
+
+Use the automated setup script for the easiest installation:
+
+**Linux/macOS:**
 ```bash
-git clone https://github.com/yourusername/cloudflare-telegram-bot.git
+git clone https://github.com/sarat1kyan/cloudflare-telegram-bot.git
+cd cloudflare-telegram-bot
+chmod +x setup.sh
+./setup.sh
+```
+
+**Windows:**
+```bash
+git clone https://github.com/sarat1kyan/cloudflare-telegram-bot.git
+cd cloudflare-telegram-bot
+setup.bat
+```
+
+The setup script will:
+- Check Python installation
+- Install all dependencies automatically
+- Guide you through configuration with a beautiful UI
+- Validate all inputs (tokens, IDs, etc.)
+- Test your configuration against Telegram and Cloudflare APIs
+- Create a `.env` file with your settings
+- Optionally create a systemd service file (Linux)
+
+**Alternative: Manual Installation**
+
+1. **Clone & Install Dependencies**
+```bash
+git clone https://github.com/sarat1kyan/cloudflare-telegram-bot.git
 cd cloudflare-telegram-bot
 pip install -r requirements.txt
 ```
 
-2. **Configuration**
-Create `.env` file:
+2. **Run Installation Script**
+```bash
+python install.py
+```
+
+The script will:
+- Guide you through configuration with a beautiful UI
+- Validate all inputs (tokens, IDs, etc.)
+- Test your configuration against Telegram and Cloudflare APIs
+- Create a `.env` file with your settings
+
+#### Manual Configuration
+
+If you prefer to configure manually:
+
+1. **Clone & Install**
+```bash
+git clone https://github.com/sarat1kyan/cloudflare-telegram-bot.git
+cd cloudflare-telegram-bot
+pip install -r requirements.txt
+```
+
+2. **Create `.env` file**
 ```env
 # Telegram
 TELEGRAM_BOT_TOKEN=your_bot_token_here
@@ -71,6 +125,13 @@ Create token with these permissions:
 - **Zone.DNS** - Edit
 - **Zone.Firewall Services** - Edit
 - **Zone.Cache Purge** - Purge
+
+**⚠️ IMPORTANT**: After setting permissions, you MUST configure the token scope:
+- Under "Zone Resources", select **"Include - Specific zone"**
+- Select your zone from the dropdown
+- **"Read all resources" alone is NOT sufficient** - you need specific zone scope
+
+📖 **See [API_TOKEN_SETUP.md](API_TOKEN_SETUP.md) for detailed step-by-step instructions**
 
 4.1 **Run the Bot | Verbose Debug Mode**
 ```bash
@@ -122,6 +183,75 @@ nohup python bot.py > output.log 2>&1 &
 | `/alarms_on` | Enable monitoring | `/alarms_on` |
 | `/alarms_off` | Disable monitoring | `/alarms_off` |
 
+### 🌐 Origin Monitoring Commands (Admin Only)
+| Command | Description | Example |
+|---------|-------------|---------|
+| `/origin_add` | Add origin URL to monitor | `/origin_add https://example.com/api/health 60 10` |
+| `/origin_remove` | Remove origin from monitoring | `/origin_remove https://example.com/api/health` |
+| `/origin_list` | List all monitored origins | `/origin_list` |
+| `/origin_check` | Manually check origin health | `/origin_check https://example.com/api/health` |
+
+**Origin Monitoring Features:**
+- ✅ **Full URL support** - Monitor specific paths (e.g., `https://example.com/api/health`)
+- ✅ **Smart error detection** - Ignores non-critical 404s (favicon, robots.txt, etc.)
+- ✅ **Configurable intervals** - Set custom check intervals per origin
+- ✅ **Failure tracking** - Tracks consecutive failures and success rates
+- ✅ **Automatic alerts** - Sends Telegram alerts on critical errors
+- ✅ **Statistics** - Shows success rate and check history
+
+**Examples:**
+```bash
+# Monitor homepage
+/origin_add https://example.com
+
+# Monitor API endpoint
+/origin_add https://example.com/api/health 120 15
+
+# Monitor specific admin path
+/origin_add https://example.com/payment/admin 60 10
+
+# Check status manually
+/origin_check https://example.com/api/health
+```
+
+**Note:** Only 5xx server errors trigger alerts. 4xx client errors (404, 403, etc.) are ignored as they indicate client-side issues, not server problems.
+
+### 🔔 Monitor Origin Served Requests
+The bot can monitor requests served by origin (cache misses) and alert when they drop below configured thresholds. This helps detect:
+- Unusually high cache hit rates (good!)
+- Reduced traffic patterns
+- Potential origin server issues
+
+**Setup:**
+```bash
+# Set thresholds for different time periods
+/origin_alert_set 30m 1000    # Alert if < 1000 requests in last 30 minutes
+/origin_alert_set 6h 5000     # Alert if < 5000 requests in last 6 hours
+/origin_alert_set 24h 20000   # Alert if < 20000 requests in last 24 hours
+
+# Enable alerts
+/origin_alert_enable
+
+# Check current status
+/origin_alert_status
+
+# Manually check against thresholds
+/origin_alert_check
+```
+
+**Features:**
+- ✅ Configurable thresholds for 30m, 6h, and 24h periods
+- ✅ Automatic alerts when requests drop below threshold
+- ✅ Recovery notifications when requests return to normal
+- ✅ Interactive button menu for easy management
+- ✅ Persistent state across bot restarts
+
+**Access via UI:**
+Click the "🔔 Origin Alerts" button in the main menu to access the interactive management interface.
+
+### 📡 Cloudflare Status Monitoring
+The bot automatically monitors the Cloudflare status page (https://www.cloudflarestatus.com/) and sends alerts when new incidents are posted. No configuration needed - it works automatically once the bot is running!
+
 ## 🎯 Usage Examples
 
 ### 🔒 Block Suspicious IP
@@ -144,12 +274,71 @@ nohup python bot.py > output.log 2>&1 &
 /cache_purge all
 ```
 
+### 🌐 Monitor Origin Health
+```bash
+# Monitor homepage (default: 60s interval, 10s timeout)
+/origin_add https://example.com
+
+# Monitor API endpoint with custom settings
+/origin_add https://example.com/api/health 120 15
+
+# Monitor specific admin path
+/origin_add https://example.com/payment/admin 60 10
+
+# Check status manually
+/origin_check https://example.com/api/health
+
+# List all monitored origins with statistics
+/origin_list
+
+# Remove origin from monitoring
+/origin_remove https://example.com/api/health
+```
+
+**Smart Error Handling:**
+- ✅ 404 errors for `/favicon.ico`, `/robots.txt` are automatically ignored
+- ✅ Only critical errors (5xx, connection failures) trigger alerts
+- ✅ Success rate tracking shows reliability over time
+
+### 🔔 Monitor Origin Served Requests
+The bot can monitor requests served by origin (cache misses) and alert when they drop below configured thresholds. This helps detect:
+- Unusually high cache hit rates (good!)
+- Reduced traffic patterns
+- Potential origin server issues
+
+**Setup:**
+```bash
+# Set thresholds for different time periods
+/origin_alert_set 30m 1000    # Alert if < 1000 requests in last 30 minutes
+/origin_alert_set 6h 5000     # Alert if < 5000 requests in last 6 hours
+/origin_alert_set 24h 20000   # Alert if < 20000 requests in last 24 hours
+
+# Enable alerts
+/origin_alert_enable
+
+# Check current status
+/origin_alert_status
+
+# Manually check against thresholds
+/origin_alert_check
+```
+
+**Features:**
+- ✅ Configurable thresholds for 30m, 6h, and 24h periods
+- ✅ Automatic alerts when requests drop below threshold
+- ✅ Recovery notifications when requests return to normal
+- ✅ Interactive button menu for easy management
+- ✅ Persistent state across bot restarts
+
+**Access via UI:**
+Click the "🔔 Origin Alerts" button in the main menu to access the interactive management interface.
+
 ## 🏗️ Architecture
 
 ```
 ┌──────────────────┐      ┌────────────────────┐    ┌─────────────────┐
-│     Telegram     │      │     Python Bot     │    │   Cloudflare    │
-│     --------     │      │     ----------     │    │   ----------    │
+│     Telegram     │      │      PocketCF      │    │   Cloudflare    │
+│     --------     │      │      --------      │    │   ----------    │
 │     Commands     │ ◄──► │     bot.py         │◄──►│   REST API      │
 │     Callbacks    │      │     - Handlers     │    │   - DNS         │
 │     Inline UI    │      │     - Admin gate   │    │   - Firewall    │

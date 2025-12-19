@@ -22,17 +22,36 @@ class CloudflareAPI:
         url = f"{self.rest_base}/{path.lstrip('/')}"
         try:
             resp = requests.request(method.upper(), url, headers=self.headers, params=params, json=json, timeout=timeout)
-            logger.info("REST %s %s -> %s", method.upper(), path, resp.status_code)
+            logger.debug("REST %s %s -> %s", method.upper(), path, resp.status_code)
+            
             if resp.status_code == 404:
+                logger.warning("Resource not found: %s", path)
                 return {"success": False, "status": 404}
+            
             resp.raise_for_status()
             data = resp.json()
+            
             if not data.get("success", True):
-                logger.error("Cloudflare API error(s): %s", data.get("errors"))
+                errors = data.get("errors", [])
+                error_messages = [err.get("message", str(err)) for err in errors]
+                logger.error("Cloudflare API error(s) for %s %s: %s", method.upper(), path, error_messages)
                 return None
+            
             return data
+        except requests.exceptions.Timeout:
+            logger.error("API Request timeout for %s %s (timeout: %ds)", method.upper(), path, timeout)
+            return None
+        except requests.exceptions.ConnectionError as e:
+            logger.error("API Connection error for %s %s: %s", method.upper(), path, e)
+            return None
+        except requests.exceptions.HTTPError as e:
+            logger.error("API HTTP error for %s %s: %s (status: %s)", method.upper(), path, e, resp.status_code if 'resp' in locals() else 'unknown')
+            return None
         except requests.RequestException as e:
-            logger.error("API Request failed: %s", e)
+            logger.error("API Request failed for %s %s: %s", method.upper(), path, e, exc_info=True)
+            return None
+        except Exception as e:
+            logger.error("Unexpected error in API request for %s %s: %s", method.upper(), path, e, exc_info=True)
             return None
 
     def _rest_get(self, path: str, params: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
@@ -54,15 +73,53 @@ class CloudflareAPI:
         payload = {"query": query, "variables": variables}
         try:
             resp = requests.post(self.graphql_url, headers=self.headers, json=payload, timeout=45)
-            logger.info("GraphQL status: %s", resp.status_code)
+            logger.debug("GraphQL status: %s", resp.status_code)
+            
+            # Check for authentication errors first
+            if resp.status_code == 401:
+                logger.error("GraphQL authentication failed (401). Check your CLOUDFLARE_API_TOKEN.")
+                logger.error("Token format: %s...", config.CLOUDFLARE_API_TOKEN[:20] if config.CLOUDFLARE_API_TOKEN else "None")
+                return None
+            
             resp.raise_for_status()
             data = resp.json()
             if data.get("errors"):
-                logger.error("GraphQL error(s): %s", data["errors"])
+                error_messages = [err.get("message", str(err)) for err in data["errors"]]
+                logger.error("GraphQL error(s): %s", error_messages)
+                # Log more details about the error
+                for err in data.get("errors", []):
+                    if err.get("message"):
+                        logger.error("  - %s", err.get("message"))
+                    if err.get("path"):
+                        logger.error("  - Path: %s", err.get("path"))
                 return None
             return data
+        except requests.exceptions.Timeout:
+            logger.error("GraphQL request timeout")
+            return None
+        except requests.exceptions.ConnectionError as e:
+            logger.error("GraphQL connection error: %s", e)
+            return None
+        except requests.exceptions.HTTPError as e:
+            status_code = resp.status_code if 'resp' in locals() else 'unknown'
+            logger.error("GraphQL HTTP error: %s (status: %s)", e, status_code)
+            if 'resp' in locals() and resp.status_code == 401:
+                logger.error("Authentication failed. Please verify your CLOUDFLARE_API_TOKEN is valid and has Analytics permissions.")
+            elif 'resp' in locals() and resp.status_code == 403:
+                logger.error("Access forbidden. Check that your API token has Zone.Analytics (Read) permission.")
+            try:
+                error_detail = resp.json() if 'resp' in locals() else {}
+                if error_detail.get("errors"):
+                    for err in error_detail["errors"]:
+                        logger.error("  API Error: %s", err.get("message", str(err)))
+            except:
+                pass
+            return None
         except requests.RequestException as e:
-            logger.error("GraphQL request failed: %s", e)
+            logger.error("GraphQL request failed: %s", e, exc_info=True)
+            return None
+        except Exception as e:
+            logger.error("Unexpected error in GraphQL request: %s", e, exc_info=True)
             return None
 
     # ========================= ZONES =========================
@@ -74,14 +131,64 @@ class CloudflareAPI:
 
     def get_zone_details(self, zone_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         zid = zone_id or config.CLOUDFLARE_ZONE_ID
-        return self._rest_get(f"zones/{zid}")
+        if not zid:
+            logger.error("No zone ID provided to get_zone_details")
+            return None
+        result = self._rest_get(f"zones/{zid}")
+        if not result:
+            logger.warning(f"Failed to get zone details for zone ID: {zid[:8]}...")
+            logger.warning("Possible causes:")
+            logger.warning("  - Zone ID is incorrect")
+            logger.warning("  - API token doesn't have Zone.Zone (Read) permission")
+            logger.warning("  - Zone doesn't exist or you don't have access to it")
+        return result
 
     # ==================== GRAPHQL ANALYTICS ==================
+    def _get_zone_tag(self, zone_id: Optional[str] = None) -> Optional[str]:
+        """Get zone tag (ID or name) for GraphQL queries.
+        
+        Cloudflare GraphQL API accepts zoneTag as either:
+        - Zone ID (32 char hex) - preferred and more reliable
+        - Zone name (domain) - may not work in all cases
+        
+        We'll use zone ID directly if available, otherwise try to get it from zone name.
+        """
+        zid = zone_id or config.CLOUDFLARE_ZONE_ID
+        if not zid:
+            logger.error("No zone ID provided")
+            return None
+        
+        # If it looks like a zone ID (32 char hex), use it directly
+        if len(zid) == 32 and all(c in '0123456789abcdefABCDEF' for c in zid):
+            logger.debug(f"Using zone ID directly as zoneTag: {zid[:8]}...")
+            return zid
+        
+        # Otherwise, it might be a zone name - try to get zone ID from it
+        # But first, let's try using it as-is (some GraphQL queries accept zone names)
+        logger.debug(f"Input appears to be zone name, trying to resolve to zone ID: {zid}")
+        try:
+            # Try to find zone by name
+            zones = self.list_zones(name=zid, per_page=1)
+            if zones and zones.get("result") and len(zones["result"]) > 0:
+                found_zone_id = zones["result"][0].get("id")
+                if found_zone_id:
+                    logger.debug(f"Resolved zone name {zid} to zone ID {found_zone_id[:8]}...")
+                    return found_zone_id
+        except Exception as e:
+            logger.warning(f"Error resolving zone name to ID: {e}")
+        
+        # Fallback: try using the input as-is (might be zone ID in different format)
+        logger.debug(f"Using input as-is for zoneTag: {zid}")
+        return zid
+    
     def get_http_requests_fixed(self, hours: int = 24, zone_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         now = datetime.now(timezone.utc)
         start = (now - timedelta(hours=hours)).strftime(ISO)
         end = now.strftime(ISO)
-        zid = zone_id or config.CLOUDFLARE_ZONE_ID
+        zone_tag = self._get_zone_tag(zone_id)
+        if not zone_tag:
+            logger.error("Failed to get zone tag for GraphQL query")
+            return None
         query = """
         query TrafficSeries($zoneTag: String!, $start: Time!, $end: Time!) {
           viewer {
@@ -92,20 +199,23 @@ class CloudflareAPI:
                 filter: { datetime_geq: $start, datetime_leq: $end }
               ) {
                 count
-                sum { edgeResponseBytes visits requests }
+                sum { edgeResponseBytes visits }
                 dimensions { datetime }
               }
             }
           }
         }
         """
-        return self._graphql(query, {"zoneTag": zid, "start": start, "end": end})
+        return self._graphql(query, {"zoneTag": zone_tag, "start": start, "end": end})
 
     def get_analytics_by_colo(self, hours: int = 24, zone_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         now = datetime.now(timezone.utc)
         start = (now - timedelta(hours=hours)).strftime(ISO)
         end = now.strftime(ISO)
-        zid = zone_id or config.CLOUDFLARE_ZONE_ID
+        zone_tag = self._get_zone_tag(zone_id)
+        if not zone_tag:
+            logger.error("Failed to get zone tag for GraphQL query")
+            return None
         query = """
         query ColoBreakdown($zoneTag: String!, $start: Time!, $end: Time!) {
           viewer {
@@ -122,13 +232,16 @@ class CloudflareAPI:
           }
         }
         """
-        return self._graphql(query, {"zoneTag": zid, "start": start, "end": end})
+        return self._graphql(query, {"zoneTag": zone_tag, "start": start, "end": end})
 
     def get_security_events(self, hours: int = 24, limit: int = 200, zone_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         now = datetime.now(timezone.utc)
         start = (now - timedelta(hours=hours)).strftime(ISO)
         end = now.strftime(ISO)
-        zid = zone_id or config.CLOUDFLARE_ZONE_ID
+        zone_tag = self._get_zone_tag(zone_id)
+        if not zone_tag:
+            logger.error("Failed to get zone tag for GraphQL query")
+            return None
         query = f"""
         query SecurityEvents($zoneTag: String!, $start: Time!, $end: Time!) {{
           viewer {{
@@ -145,13 +258,16 @@ class CloudflareAPI:
           }}
         }}
         """
-        return self._graphql(query, {"zoneTag": zid, "start": start, "end": end})
+        return self._graphql(query, {"zoneTag": zone_tag, "start": start, "end": end})
 
     def get_http_by_cache_status(self, hours: int = 24, zone_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         now = datetime.now(timezone.utc)
         start = (now - timedelta(hours=hours)).strftime(ISO)
         end = now.strftime(ISO)
-        zid = zone_id or config.CLOUDFLARE_ZONE_ID
+        zone_tag = self._get_zone_tag(zone_id)
+        if not zone_tag:
+            logger.error("Failed to get zone tag for GraphQL query")
+            return None
         query = """
         query CacheStatusSplit($zoneTag: String!, $start: Time!, $end: Time!) {
           viewer {
@@ -160,20 +276,23 @@ class CloudflareAPI:
                 limit: 1000
                 filter: { datetime_geq: $start, datetime_leq: $end }
               ) {
-                sum { requests }
+                count
                 dimensions { cacheStatus }
               }
             }
           }
         }
         """
-        return self._graphql(query, {"zoneTag": zid, "start": start, "end": end})
+        return self._graphql(query, {"zoneTag": zone_tag, "start": start, "end": end})
 
     def get_top_mitigated_ips(self, hours: int = 24, limit: int = 10, zone_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         now = datetime.now(timezone.utc)
         start = (now - timedelta(hours=hours)).strftime(ISO)
         end = now.strftime(ISO)
-        zid = zone_id or config.CLOUDFLARE_ZONE_ID
+        zone_tag = self._get_zone_tag(zone_id)
+        if not zone_tag:
+            logger.error("Failed to get zone tag for GraphQL query")
+            return None
         query = f"""
         query TopMitigatedIPs($zoneTag: String!, $start: Time!, $end: Time!) {{
           viewer {{
@@ -194,7 +313,7 @@ class CloudflareAPI:
           }}
         }}
         """
-        return self._graphql(query, {"zoneTag": zid, "start": start, "end": end})
+        return self._graphql(query, {"zoneTag": zone_tag, "start": start, "end": end})
 
     # -------- DNS analytics (REST)
     def get_dns_analytics_report(

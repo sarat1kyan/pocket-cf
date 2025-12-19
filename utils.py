@@ -1,5 +1,6 @@
-from typing import List, Iterable, Any
+from typing import List, Iterable, Any, Tuple, Optional
 import math
+import ipaddress
 from html import escape as _escape
 
 def escape(s: Any) -> str:
@@ -83,3 +84,47 @@ def sparkline(values: Iterable[float], max_len: int = 60) -> str:
         idx = int((v - lo) / (hi - lo) * (len(ticks) - 1))
         out.append(ticks[idx])
     return "".join(out)
+
+def validate_ip_or_cidr(value: str) -> Tuple[bool, Optional[str]]:
+    """
+    Validate if a string is a valid IP address or CIDR range.
+    Returns (is_valid, error_message).
+    """
+    if not value or not isinstance(value, str):
+        return False, "Value cannot be empty"
+    
+    value = value.strip()
+    
+    # Check for CIDR notation
+    if '/' in value:
+        try:
+            ipaddress.ip_network(value, strict=False)
+            return True, None
+        except ValueError as e:
+            return False, f"Invalid CIDR range: {str(e)}"
+    else:
+        # Check for IP address
+        try:
+            ipaddress.ip_address(value)
+            return True, None
+        except ValueError:
+            return False, f"Invalid IP address format: {value}"
+
+def sanitize_string(value: str, max_length: int = 500) -> str:
+    """Sanitize and truncate string input."""
+    if not value:
+        return ""
+    value = str(value).strip()
+    if len(value) > max_length:
+        value = value[:max_length]
+    return value
+
+def validate_hours(value: Any) -> Tuple[bool, Optional[int]]:
+    """Validate hours parameter and return (is_valid, hours_int)."""
+    try:
+        hours = int(value)
+        if hours < 1 or hours > 168:  # Max 7 days
+            return False, None
+        return True, hours
+    except (ValueError, TypeError):
+        return False, None
